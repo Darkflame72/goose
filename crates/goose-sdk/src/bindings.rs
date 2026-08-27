@@ -993,6 +993,15 @@ pub fn databricks_v2_default_model() -> String {
 
 #[uniffi::export]
 pub fn databricks_v2_provider(host: String, token: String) -> Result<Arc<Provider>, GooseError> {
+    databricks_v2_provider_with_gateway_path(host, token, None)
+}
+
+#[uniffi::export]
+pub fn databricks_v2_provider_with_gateway_path(
+    host: String,
+    token: String,
+    gateway_path: Option<String>,
+) -> Result<Arc<Provider>, GooseError> {
     let retry_config = GooseDatabricksV2Provider::load_retry_config(|key| std::env::var(key).ok());
     let provider = GooseDatabricksV2Provider::new(
         host,
@@ -1004,6 +1013,11 @@ pub fn databricks_v2_provider(host: String, token: String) -> Result<Arc<Provide
         None,
         None,
     )?;
+
+    let provider = match gateway_path {
+        Some(gateway_path) => provider.with_gateway_path(&gateway_path)?,
+        None => provider,
+    };
 
     Ok(Provider::new(Box::new(provider)))
 }

@@ -78,11 +78,43 @@ pub const DATABRICKS_V2_KNOWN_MODELS: &[&str] =
 
 pub const DATABRICKS_V2_DOC_URL: &str = "https://docs.databricks.com/en/generative-ai/ai-gateway/";
 
+const DATABRICKS_V2_DEFAULT_GATEWAY_PATH: &str = "ai-gateway";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabricksV2Route {
     OpenAiResponses,
     AnthropicMessages,
     MlflowChatCompletions,
+}
+
+fn normalize_gateway_path(gateway_path: &str) -> Result<String> {
+    let trimmed = gateway_path.trim();
+    if trimmed.contains("://") {
+        anyhow::bail!(
+            "Databricks gateway path `{gateway_path}` must be a path such as `{DATABRICKS_V2_DEFAULT_GATEWAY_PATH}`, not a URL; configure the workspace URL as the provider host instead"
+        );
+    }
+
+    let normalized = trimmed.trim_matches('/').to_string();
+    if normalized.is_empty() {
+        anyhow::bail!(
+            "Databricks gateway path must not be empty; use `{DATABRICKS_V2_DEFAULT_GATEWAY_PATH}` for the default deployment"
+        );
+    }
+
+    for suffix in [
+        "openai/v1/responses",
+        "anthropic/v1/messages",
+        "mlflow/v1/chat/completions",
+    ] {
+        if normalized.ends_with(suffix) {
+            anyhow::bail!(
+                "Databricks gateway path `{gateway_path}` must not include the API suffix `{suffix}`; pass only the gateway base path such as `{DATABRICKS_V2_DEFAULT_GATEWAY_PATH}`"
+            );
+        }
+    }
+
+    Ok(normalized)
 }
 
 #[derive(Serialize)]
@@ -97,6 +129,8 @@ pub struct DatabricksV2Provider {
     token_cache: Arc<Mutex<Option<String>>>,
     #[serde(skip)]
     refresh_hook: Option<DatabricksRefreshHook>,
+    #[serde(skip)]
+    gateway_path: String,
 }
 
 impl DatabricksV2Provider {
@@ -143,7 +177,22 @@ impl DatabricksV2Provider {
             name: DATABRICKS_V2_PROVIDER_NAME.to_string(),
             token_cache,
             refresh_hook,
+            gateway_path: DATABRICKS_V2_DEFAULT_GATEWAY_PATH.to_string(),
         })
+    }
+
+    pub fn with_gateway_path(mut self, gateway_path: &str) -> Result<Self> {
+        self.gateway_path = normalize_gateway_path(gateway_path)?;
+        Ok(self)
+    }
+
+    fn route_path(&self, route: DatabricksV2Route) -> String {
+        let suffix = match route {
+            DatabricksV2Route::OpenAiResponses => "openai/v1/responses",
+            DatabricksV2Route::AnthropicMessages => "anthropic/v1/messages",
+            DatabricksV2Route::MlflowChatCompletions => "mlflow/v1/chat/completions",
+        };
+        format!("{}/{suffix}", self.gateway_path)
     }
 
     pub fn load_retry_config(get_param: impl Fn(&str) -> Option<String>) -> RetryConfig {
@@ -282,12 +331,13 @@ impl DatabricksV2Provider {
             openai_responses::create_responses_request(model_config, system, messages, tools)?;
         payload["stream"] = Value::Bool(true);
         let mut log = start_log(model_config, &payload)?;
+        let responses_path = self.route_path(DatabricksV2Route::OpenAiResponses);
 
         let response = self
             .with_retry(|| async {
                 let resp = self
                     .api_client
-                    .request("ai-gateway/openai/v1/responses")
+                    .request(&responses_path)
                     .model_headers(model_config)?
                     .streaming(true)
                     .response_post(&payload)
@@ -330,12 +380,13 @@ impl DatabricksV2Provider {
             payload["max_tokens"] = Value::from(model_config.max_output_tokens());
         }
         let mut log = start_log(model_config, &payload)?;
+        let chat_path = self.route_path(DatabricksV2Route::MlflowChatCompletions);
 
         let response = self
             .with_retry(|| async {
                 let resp = self
                     .api_client
-                    .request("ai-gateway/mlflow/v1/chat/completions")
+                    .request(&chat_path)
                     .model_headers(model_config)?
                     .streaming(true)
                     .response_post(&payload)
@@ -367,12 +418,13 @@ impl DatabricksV2Provider {
         )?;
         payload["stream"] = Value::Bool(true);
         let mut log = start_log(model_config, &payload)?;
+        let messages_path = self.route_path(DatabricksV2Route::AnthropicMessages);
 
         let response = self
             .with_retry(|| async {
                 let resp = self
                     .api_client
-                    .request("ai-gateway/anthropic/v1/messages")
+                    .request(&messages_path)
                     .model_headers(model_config)?
                     .streaming(true)
                     .response_post(&payload)
@@ -566,6 +618,7 @@ impl DatabricksV2Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::MockServer;
 
     #[test]
     fn routes_known_model_families() {
@@ -696,32 +749,221 @@ mod tests {
         }
     }
 
+    fn provider(server: &MockServer) -> DatabricksV2Provider {
+        provider_with_retry(server, RetryConfig::new(0, 0, 1.0, 0))
+    }
+
+    fn provider_with_retry(server: &MockServer, retry_config: RetryConfig) -> DatabricksV2Provider {
+        DatabricksV2Provider::new(
+            server.uri(),
+            DatabricksAuth::token("test-token".to_string()),
+            retry_config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn default_gateway_path_preserves_builtin_routes() {
+        let server_uri = "https://host.example.com".to_string();
+        let provider = DatabricksV2Provider::new(
+            server_uri,
+            DatabricksAuth::token("test-token".to_string()),
+            RetryConfig::new(0, 0, 1.0, 0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider.route_path(DatabricksV2Route::OpenAiResponses),
+            "ai-gateway/openai/v1/responses"
+        );
+        assert_eq!(
+            provider.route_path(DatabricksV2Route::AnthropicMessages),
+            "ai-gateway/anthropic/v1/messages"
+        );
+        assert_eq!(
+            provider.route_path(DatabricksV2Route::MlflowChatCompletions),
+            "ai-gateway/mlflow/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn custom_gateway_path_is_preserved_in_route_paths() {
+        let provider = DatabricksV2Provider::new(
+            "https://host.example.com".to_string(),
+            DatabricksAuth::token("test-token".to_string()),
+            RetryConfig::new(0, 0, 1.0, 0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_gateway_path("/gateways/team-a/ai-gateway/")
+        .unwrap();
+
+        assert_eq!(
+            provider.route_path(DatabricksV2Route::OpenAiResponses),
+            "gateways/team-a/ai-gateway/openai/v1/responses"
+        );
+        assert_eq!(
+            provider.route_path(DatabricksV2Route::MlflowChatCompletions),
+            "gateways/team-a/ai-gateway/mlflow/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn invalid_gateway_paths_report_actionable_errors() {
+        for invalid in ["", "   ", "/"] {
+            let error = normalize_gateway_path(invalid).unwrap_err().to_string();
+            assert!(
+                error.contains("must not be empty"),
+                "unexpected error: {error}"
+            );
+        }
+
+        let error = normalize_gateway_path("https://host.example.com/ai-gateway")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a URL"), "unexpected error: {error}");
+
+        let error = normalize_gateway_path("ai-gateway/openai/v1/responses")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must not include the API suffix"),
+            "unexpected error: {error}"
+        );
+    }
+
+    mod gateway_routing {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const RESPONSES_SSE: &str = concat!(
+            r#"data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"hi"}"#,
+            "\n\n",
+            r#"data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"completed","model":"databricks-gpt-5-5","output":[{"type":"function_call","call_id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        const CHAT_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\ndata: [DONE]\n\n";
+
+        async fn mount_sse(server: &MockServer, expected_path: &str, body: &str) {
+            Mock::given(method("POST"))
+                .and(path(expected_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(body),
+                )
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        async fn drain(
+            stream: MessageStream,
+        ) -> (
+            Vec<Message>,
+            Option<goose_provider_types::conversation::token_usage::ProviderUsage>,
+        ) {
+            let mut stream = stream;
+            let mut messages = Vec::new();
+            let mut usage = None;
+            while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                let (message, chunk_usage) = item.unwrap();
+                messages.extend(message);
+                if chunk_usage.is_some() {
+                    usage = chunk_usage;
+                }
+            }
+            (messages, usage)
+        }
+
+        #[tokio::test]
+        async fn default_gateway_path_streams_text_tool_calls_and_usage() {
+            let server = MockServer::start().await;
+            mount_sse(&server, "/ai-gateway/openai/v1/responses", RESPONSES_SSE).await;
+
+            let stream = provider(&server)
+                .stream(
+                    &ModelConfig::new("databricks-gpt-5-5"),
+                    "system",
+                    &[Message::user().with_text("hello")],
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            let (messages, usage) = drain(stream).await;
+            let usage = usage.expect("usage from responses stream");
+            assert_eq!(usage.usage.input_tokens, Some(3));
+            assert_eq!(usage.usage.output_tokens, Some(5));
+            assert_eq!(usage.usage.total_tokens, Some(8));
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.as_concat_text().contains("hi")),
+                "expected streamed text, got {messages:?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .flat_map(|message| message.content.iter())
+                    .filter_map(|content| content.as_tool_request())
+                    .any(|request| request
+                        .tool_call
+                        .as_ref()
+                        .is_ok_and(|call| call.name == "shell")),
+                "expected streamed tool call, got {messages:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn custom_gateway_path_is_used_for_requests() {
+            let server = MockServer::start().await;
+            mount_sse(
+                &server,
+                "/gateways/team-a/mlflow/v1/chat/completions",
+                CHAT_SSE,
+            )
+            .await;
+
+            let stream = provider(&server)
+                .with_gateway_path("gateways/team-a")
+                .unwrap()
+                .stream(
+                    &ModelConfig::new("custom-model"),
+                    "system",
+                    &[Message::user().with_text("hello")],
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            drain(stream).await;
+        }
+    }
+
     mod fetch_supported_models {
         use super::*;
         use serde_json::json;
         use wiremock::matchers::{method, path, query_param, query_param_is_missing};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        fn provider(server: &MockServer) -> DatabricksV2Provider {
-            provider_with_retry(server, RetryConfig::new(0, 0, 1.0, 0))
-        }
-
-        fn provider_with_retry(
-            server: &MockServer,
-            retry_config: RetryConfig,
-        ) -> DatabricksV2Provider {
-            DatabricksV2Provider::new(
-                server.uri(),
-                DatabricksAuth::token("test-token".to_string()),
-                retry_config,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap()
-        }
+        use wiremock::{Mock, ResponseTemplate};
 
         async fn mount_endpoints(server: &MockServer, body: serde_json::Value) {
             Mock::given(method("GET"))

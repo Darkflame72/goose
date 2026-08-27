@@ -99,6 +99,33 @@
           "isAsync": false
         },
         {
+          "name": "databricks_v2_provider_with_gateway_path",
+          "docs": "",
+          "params": [
+            {
+              "name": "host",
+              "type": "String",
+              "default": null,
+              "docs": ""
+            },
+            {
+              "name": "token",
+              "type": "String",
+              "default": null,
+              "docs": ""
+            },
+            {
+              "name": "gateway_path",
+              "type": "Option<String>",
+              "default": null,
+              "docs": ""
+            }
+          ],
+          "returns": "Provider",
+          "throws": "GooseError",
+          "isAsync": false
+        },
+        {
           "name": "declarative_provider_from_json",
           "docs": "",
           "params": [
